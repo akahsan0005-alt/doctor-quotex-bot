@@ -1,44 +1,97 @@
-# requirements: websockets, asyncio, pandas, ta, python-telegram-bot
-import asyncio, json, time
+import os
 import pandas as pd
-import numpy as np
-from ta.momentum import RSIIndicator
-from telegram import Bot
-# Placeholder: replace with actual Quotex websocket client or implement handshake
-QUOTEX_WSS = "wss://quotex-ws.example"  # use client library endpoints instead
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "@your_channel_or_chat_id"
-ASSET = "OTC_ASSET_NAME"
-LOT = 1.0  # fixed stake per signal (no martingale)
+import pandas_ta as ta
+import requests
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from datetime import datetime
 
-bot = Bot(token=TELEGRAM_TOKEN)
-df = pd.DataFrame(columns=["time","open","high","low","close","volume"])
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-def compute_indicators(df):
-    df["ema8"] = df["close"].ewm(span=8, adjust=False).mean()
-    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
-    df["rsi"] = RSIIndicator(df["close"], window=14).rsi()
-    return df
+SYMBOL = "OTC"
+TIMEFRAME = "1m"
 
-async def handle_candle(candle):
-    global df
-    # candle: dict with timestamp, o,h,l,c,v
-    df = df.append({
-        "time": candle["t"], "open": candle["o"], "high": candle["h"],
-        "low": candle["l"], "close": candle["c"], "volume": candle.get("v",0)
-    }, ignore_index=True)
-    if len(df) < 30: return
-    df = df.tail(200).reset_index(drop=True)
-    df = compute_indicators(df)
-    last = df.iloc[-1]; prev = df.iloc[-2]
-    # EMA crossover + RSI filter
-    if prev["ema8"] <= prev["ema21"] and last["ema8"] > last["ema21"] and last["rsi"] < 70:
-        await send_signal("BUY", last["close"])
-    elif prev["ema8"] >= prev["ema21"] and last["ema8"] < last["ema21"] and last["rsi"] > 30:
-        await send_signal("SELL", last["close"])
+# =========================
+# PRICE DATA (PLACEHOLDER)
+# =========================
+def get_candles():
+    """
+    Replace this function with:
+    - TradingView webhook
+    - Your own candle feed
+    - CSV upload
+    """
+    df = pd.read_csv("candles.csv")  # columns: time, open, high, low, close
+    return df.tail(100)
 
-async def send_signal(side, price):
-    text = f"Signal: {side}\nAsset: {ASSET}\nPrice: {price}\nStake: {LOT}\nTimeframe: 1m\nNo martingale."
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+# =========================
+# STRATEGY ENGINE
+# =========================
+def analyze_market(df):
+    df["ema9"] = ta.ema(df["close"], length=9)
+    df["ema21"] = ta.ema(df["close"], length=21)
+    df["rsi"] = ta.rsi(df["close"], length=14)
+    macd = ta.macd(df["close"])
+    stoch = ta.stochrsi(df["close"])
+    df["atr"] = ta.atr(df["high"], df["low"], df["close"])
 
-# NOTE: implement WebSocket connection using a maintained client (see repos). On each 1m candle call handle_candle().
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    if (
+        last.ema9 > last.ema21
+        and 52 < last.rsi < 68
+        and macd.iloc[-1]["MACDh_12_26_9"] > 0
+        and stoch.iloc[-1]["STOCHRSIk_14_14_3_3"] > stoch.iloc[-2]["STOCHRSIk_14_14_3_3"]
+        and last.atr > df["atr"].mean()
+        and last.close > prev.close
+    ):
+        return "CALL"
+
+    if (
+        last.ema9 < last.ema21
+        and 32 < last.rsi < 48
+        and macd.iloc[-1]["MACDh_12_26_9"] < 0
+        and stoch.iloc[-1]["STOCHRSIk_14_14_3_3"] < stoch.iloc[-2]["STOCHRSIk_14_14_3_3"]
+        and last.atr > df["atr"].mean()
+        and last.close < prev.close
+    ):
+        return "PUT"
+
+    return None
+
+# =========================
+# TELEGRAM COMMAND
+# =========================
+async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        df = get_candles()
+        direction = analyze_market(df)
+
+        if direction:
+            msg = f"""
+📊 *QUOTEX OTC SIGNAL*
+⏱ Timeframe: 1 Minute
+📈 Direction: *{direction}*
+🚫 Martingale: NO
+🕒 Signal Time: {datetime.utcnow()} UTC
+"""
+        else:
+            msg = "❌ No high-probability setup found. Waiting for confirmation."
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error: {e}")
+
+# =========================
+# BOT START
+# =========================
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("signal", signal))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
