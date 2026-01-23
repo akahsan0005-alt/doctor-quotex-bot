@@ -1,119 +1,44 @@
-import yfinance as yf
+# requirements: websockets, asyncio, pandas, ta, python-telegram-bot
+import asyncio, json, time
 import pandas as pd
 import numpy as np
-import time
-import joblib
-import os
-from datetime import datetime
-from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator
 from telegram import Bot
-from sklearn.linear_model import LogisticRegression
+# Placeholder: replace with actual Quotex websocket client or implement handshake
+QUOTEX_WSS = "wss://quotex-ws.example"  # use client library endpoints instead
+TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "@your_channel_or_chat_id"
+ASSET = "OTC_ASSET_NAME"
+LOT = 1.0  # fixed stake per signal (no martingale)
 
-# ================= CONFIG =================
-TOKEN = os.environ["TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
+bot = Bot(token=TELEGRAM_TOKEN)
+df = pd.DataFrame(columns=["time","open","high","low","close","volume"])
 
-bot = Bot(token=TOKEN)
+def compute_indicators(df):
+    df["ema8"] = df["close"].ewm(span=8, adjust=False).mean()
+    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+    df["rsi"] = RSIIndicator(df["close"], window=14).rsi()
+    return df
 
-ASSETS = {
-    "EURUSD OTC": "EURUSD=X",
-    "GBPUSD OTC": "GBPUSD=X",
-    "USDJPY OTC": "JPY=X"
-}
+async def handle_candle(candle):
+    global df
+    # candle: dict with timestamp, o,h,l,c,v
+    df = df.append({
+        "time": candle["t"], "open": candle["o"], "high": candle["h"],
+        "low": candle["l"], "close": candle["c"], "volume": candle.get("v",0)
+    }, ignore_index=True)
+    if len(df) < 30: return
+    df = df.tail(200).reset_index(drop=True)
+    df = compute_indicators(df)
+    last = df.iloc[-1]; prev = df.iloc[-2]
+    # EMA crossover + RSI filter
+    if prev["ema8"] <= prev["ema21"] and last["ema8"] > last["ema21"] and last["rsi"] < 70:
+        await send_signal("BUY", last["close"])
+    elif prev["ema8"] >= prev["ema21"] and last["ema8"] < last["ema21"] and last["rsi"] > 30:
+        await send_signal("SELL", last["close"])
 
-TIMEFRAME = "1m"
-LOOKBACK = "7d"
+async def send_signal(side, price):
+    text = f"Signal: {side}\nAsset: {ASSET}\nPrice: {price}\nStake: {LOT}\nTimeframe: 1m\nNo martingale."
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
-AI_MODEL_PATH = "ai_filter.pkl"
-AUTO_RETRAIN_DAYS = 7
-
-BOT_ACTIVE = True
-TOTAL_TRADES = WINS = LOSSES = 0
-LAST_RETRAIN = None
-LAST_REPORT_DAY = None
-
-# ================= AI =================
-def retrain_ai():
-    global LAST_RETRAIN
-
-    if LAST_RETRAIN and (datetime.utcnow() - LAST_RETRAIN).days < AUTO_RETRAIN_DAYS:
-        return
-
-    frames = []
-    for symbol in ASSETS.values():
-        df = yf.download(symbol, interval=TIMEFRAME, period=LOOKBACK)
-        df.dropna(inplace=True)
-
-        df["ema50"] = EMAIndicator(df["Close"], 50).ema_indicator()
-        df["ema200"] = EMAIndicator(df["Close"], 200).ema_indicator()
-        df["rsi"] = RSIIndicator(df["Close"], 14).rsi()
-        df["future"] = df["Close"].shift(-1)
-        df["label"] = (df["future"] > df["Close"]).astype(int)
-
-        frames.append(df)
-
-    data = pd.concat(frames).dropna()
-
-    X = data[["rsi", "ema50", "ema200"]]
-    y = data["label"].values.ravel()  # ✅ FIXED
-
-    model = LogisticRegression(max_iter=1000)
-    model.fit(X, y)
-    joblib.dump(model, AI_MODEL_PATH)
-
-    LAST_RETRAIN = datetime.utcnow()
-    bot.send_message(chat_id=CHAT_ID, text="🤖 AI retrained")
-
-# ================= SIGNAL =================
-def generate_signal(name, symbol):
-    df = yf.download(symbol, interval=TIMEFRAME, period=LOOKBACK)
-    df.dropna(inplace=True)
-
-    df["ema50"] = EMAIndicator(df["Close"], 50).ema_indicator()
-    df["ema200"] = EMAIndicator(df["Close"], 200).ema_indicator()
-    df["rsi"] = RSIIndicator(df["Close"], 14).rsi()
-
-    last = df.iloc[-1]
-
-    if last["ema50"] > last["ema200"] and 40 < last["rsi"] < 55:
-        return f"📈 CALL {name}"
-
-    if last["ema50"] < last["ema200"] and 45 < last["rsi"] < 60:
-        return f"📉 PUT {name}"
-
-    return None
-
-# ================= MAIN LOOP =================
-bot.send_message(chat_id=CHAT_ID, text="✅ Bot started")
-
-while True:
-    try:
-        retrain_ai()
-
-        today = datetime.utcnow().date()
-        if LAST_REPORT_DAY != today:
-            if LAST_REPORT_DAY:
-                rate = 0 if TOTAL_TRADES == 0 else (WINS / TOTAL_TRADES) * 100
-                bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"📊 Daily Report\nTrades: {TOTAL_TRADES}\nWin rate: {rate:.2f}%"
-                )
-                TOTAL_TRADES = WINS = LOSSES = 0
-            LAST_REPORT_DAY = today
-
-        if BOT_ACTIVE:
-            for name, symbol in ASSETS.items():
-                signal = generate_signal(name, symbol)
-                if signal:
-                    bot.send_message(
-                        chat_id=CHAT_ID,
-                        text=f"{signal}\nReply with: /win or /loss"
-                    )
-                    break
-
-        time.sleep(60)
-
-    except Exception as e:
-        bot.send_message(chat_id=CHAT_ID, text=f"⚠️ Error: {e}")
-        time.sleep(60)
+# NOTE: implement WebSocket connection using a maintained client (see repos). On each 1m candle call handle_candle().
